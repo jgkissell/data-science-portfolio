@@ -1,0 +1,326 @@
+---
+title: "MalarialUnit2"
+author: "Jack Kissell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Overall model formulation is as follows:
+
+$$
+Y_{it} \sim Poisson(\mu_{it}) \\
+\mu_{it} = E_{it}R_{it} \\
+ln(E_{it})=\beta x^T_i+E_{it}+\psi_{it}
+$$
+
+where $Y_{it}$ is the number of observed cases in location $i$, year $t$, $E_{it}$ is the *expected* number of cases (assumed known & fixed), and $R_{it}$ is the relative risk. Spatio-temporal autocorrelation is induced in the model via latent effects $\mathbf{\psi}$ using CAR priors (which requires a sparse spatial adjacency matrix).
+
+An alternative s-t model formulation is:
+
+$$
+Y_{it} \sim Poisson(\mu_{it}) \\
+\mu_{it} = E_{it}R_{it} \\
+ln(R_{it})=\alpha +\beta x_i+\nu_{i}+w_{t} \\
+\nu_i \sim CAR(\sigma^2_v) \\
+w_t \sim RW(0, \sigma^2_w) \\
+\sigma^2_v, \sigma^2_w \sim IG
+$$
+
+Non-temporal hierarchical model:
+
+$$
+Y_i \sim Poisson(E_i \times exp(\beta+u_i)) \\
+u_i \sim CAR(\sigma^2_v)
+$$
+
+```{r}
+library('dplyr')
+library('sf')
+library('sp')
+library('spdep')
+library('CARBayesST')
+library('CARBayes')
+library('RColorBrewer')
+library('xts')
+library('ggplot2')
+```
+
+Read in data & data wrangling:
+
+```{r}
+mal.1 <- read.csv("WestAfrica.csv")
+mal.2 <- read.csv("Nigeria_Counts.csv")
+
+#join 2 datasets & get population count
+malPop <- filter(mal.1, National.Unit == 'Nigeria' & Metric == 'Incidence Rate') %>%
+  inner_join(mal.2, by = join_by(Year == Year, Name == Name)) %>%
+  rename(Observed = Value.y, Rate = Value.x) %>%
+  mutate(Pop = 1000 * Observed/ Rate) %>%
+  mutate(Expected = Pop * sum(Observed)/sum(Pop))
+
+malPop <- malPop[, c("Name", "Year", "Rate", "Observed", "Expected", "Pop")]
+
+climate <- read.csv("Nigeria_Climate_Aggregate.csv")
+
+malPop <- inner_join(malPop, climate, by=join_by(Name == name))
+
+sp_av <- aggregate(malPop[,"Observed"], list(malPop$Name), mean)
+```
+
+```{r}
+#get polygon shapefile:
+boundaries <- st_read("NG_Admin/nga_admbnda_adm1_osgof_20161215.shp")
+boundaries <- boundaries[,c("admin0Name", "admin1Name", "geometry")]
+
+#spelling corrections
+boundaries[which(boundaries$admin1Name=="Nasarawa"),]$admin1Name <- "Nassarawa"
+boundaries[which(boundaries$admin1Name=="Federal Capital Territory"),]$admin1Name <- "Abuja"
+
+malPop <- inner_join(boundaries, malPop, c("admin1Name" = "Name"))
+```
+
+```{r}
+#relative risk
+malPop$RR <- with(malPop, Observed / Expected)
+malPop$logRR <- log(malPop$RR)
+#average of RR is 1; interested in regions where RR is significantly > 1
+
+```
+
+### Some Plots
+
+```{r}
+#empirical spatial means by latitude and longitude
+coords <- st_coordinates(st_centroid(boundaries))
+plot1dat <- data.frame(Group.1=c(boundaries$admin1Name),lat=coords[,1],lon=coords[,2])
+
+sp_av <- left_join(sp_av, plot1dat, by="Group.1")
+head(sp_av)
+
+par(mfrow=c(1,2))
+plot(sp_av$lat,sp_av$x)
+plot(sp_av$lon,sp_av$x)
+```
+
+```{r}
+png('Fig2b.png')
+
+boxplot(Rate ~ Year, data = malPop, range = 0, xlab = "Year",
+        ylab = "Case Rate", col="cadetblue3")
+```
+
+```{r}
+png('Fig2c.png')
+
+p <- ggplot(malPop, aes(Year, Rate, group=Year))
+p + geom_boxplot(fill="cadetblue3") +scale_x_continuous(breaks = seq(2010, 2022, by=1))
+```
+
+
+can see a slight trend in relative risk over time, with a decline in the early years especially. Note the reduction in variance starting around 2016. Worth including temporal effect in the model to see if it's significant.
+
+```{r}
+temp <- malPop[, c(5, 3, 7, 9, 11)]
+
+temp$Observed <- as.integer(temp$Observed)
+temp$Pop <- as.integer(temp$Pop)
+temp$average_mean <- as.integer(temp$average_mean)
+temp$average_precipitation <- as.integer(temp$average_precipitation)
+
+pairs(temp[ , -6], pch = 19, cex = 0.5, lower.panel = NULL)
+```
+
+```{r}
+Pal <- colorRampPalette(brewer.pal(3, "YlGnBu"))
+
+par(mfrow=c(1,2))
+plot(st_geometry(avg), col=Pal(10)[as.numeric(cut(avg$Pop,breaks = 10))])
+plot(st_geometry(avg), col=Pal(10)[as.numeric(cut(avg$average_mean,breaks = 10))])
+```
+
+```{r}
+#time_av <- malPop %>% group_by(Year) %>%
+#  summarise(tmp_av = mean(Observed / Pop))
+
+time_av <- malPop %>% group_by(Year) %>%
+  summarise(tmp_av = mean(Rate))
+
+plot(time_av$Year, time_av$tmp_av, type="l")
+```
+
+```{r}
+#average plots:
+
+spatial_avg <- malPop %>% group_by(admin1Name) %>%
+  summarise(count_av = mean(round(Observed)), rate_av = mean(Rate))
+
+Pal <- colorRampPalette(rev(brewer.pal(3, "YlGnBu")))
+
+par(mfrow=c(1,2))
+plot(st_geometry(spatial_avg), col=Pal(10)[as.numeric(cut(spatial_avg$count_av,breaks = 10))], main="Average Number of Cases")
+plot(st_geometry(spatial_avg), col=Pal(10)[as.numeric(cut(spatial_avg$rate_av,breaks = 10))], main="Average Cases per 1,000")
+```
+
+
+
+
+```{r}
+ggplot() +
+  geom_line(data = malPop, mapping = aes(x =Year, y = Rate,
+                          group = admin1Name), color = "lightgray") +
+   theme_classic() +
+  geom_smooth(data = time_av, mapping = aes(x =Year, y = tmp_av), 
+              alpha = 0.5)
+```
+
+```{r}
+total_cnt <- malPop %>% group_by(Year) %>%
+  summarise(cases = sum(Observed)) 
+total_cases_ts <- ts(total_cnt$cases, 
+                     start = 2010,
+                     frequency=1)
+
+lag_cases <- total_cnt$cases[-1]
+total_cnt <- cbind(total_cnt[1:12,], lag_cases)
+cor(total_cnt[ , 2:3])
+```
+
+skipping ahead to fitting CAR model:
+
+```{r}
+set.seed(999)
+
+#all data vectors (response, offset and covariates) have to be ordered by Year#
+malPop <- arrange(malPop, Year)
+
+# create proximity weights matrix W
+W.nb <- poly2nb(boundaries)            #build a neighbors list
+W.list <- nb2listw(W.nb, style = "B")  #add spatial weights (basic binary coding)
+W <- nb2mat(W.nb, style = "B")         #get weights matrix W
+
+#model
+formula <- round(Observed) ~ offset(log(round(Expected))) + scale(Pop) + scale(average_precipitation) + scale(average_mean)
+
+n.samples <- 25000
+burn.in <- floor(0.25*n.samples)
+
+model2 <- ST.CARanova(formula, family = "poisson",
+                   data = malPop, W = W, burnin = burn.in, 
+                   n.sample = n.samples, interaction=FALSE)
+
+model2
+```
+
+population covariate looks good. Average precipitation distribution is multimodal, suggesting we might need to include further covariates besides precipitation.
+
+Edit: after adding average temperature the distribution of the precipitation covariate looks more normal but still slightly multimodal.
+
+```{r}
+par(pty = "m")
+colnames(model2$samples$beta) <- c("Intercept", "scale(Pop)",
+                                   "scale(average_precipitation)", "scale(average_mean)")
+plot(exp(model2$samples$beta[,-1]))
+```
+
+```{r}
+parameter.summary <- model2$
+round(parameter.summary$quantiles, 3)
+```
+
+```{r}
+plot(exp(model2$samples$rho))
+plot(exp(model2$samples$tau2))
+```
+
+```{r}
+model1 <- ST.CARanova(formula, family = "gaussian",
+                   data = malPop, W = W, burnin = burn.in, 
+                   n.sample = n.samples)
+
+model1
+```
+
+### Alternative model setup
+
+CARBayesST uses a CAR model format for both the spatial and temporal effect. Here I'm going to use CARBayes to fit a CAR spatial model and just include Year as a linear covariate
+
+```{r}
+#testing r2Bayesx
+library(R2BayesX)
+
+graph <- nb2gra(W.nb)
+
+f2 <- round(Observed) ~ scale(Pop) + scale(average_precipitation) +
+  scale(average_mean) + sx(Year, bs="rw1") + sx(admin1Name, bs="spatial", map=graph)
+
+xBayes <- bayesx(formula=f2, offset=(log(round(malPop$Expected))),
+                 family="poisson", data=malPop)
+```
+
+```{r}
+#attempt 2
+f3 <- round(Observed) ~ scale(Pop) + scale(average_precipitation) +
+  scale(average_mean) + sx(Year, bs="rw1") + sx(admin1Name, bs = "gk", map = boundaries)
+
+
+b <- bayesx(f3, offset=(log(round(malPop$Expected))), 
+            family = "poisson", method = "MCMC", data = malPop)
+```
+
+Moving on from modeling, I want to do some hot spot detection.
+
+We do this with the Getis-Ord statistic on the incidence per population values.
+
+```{r}
+temp <- filter(malPop, Year == 2022)
+
+mat1 <- boundaries %>% st_as_sf() %>% st_touches()
+mat1 <- 1*as.matrix(mat1)
+
+for(i in 2010:2022){
+
+  gstat <- (filter(malPop, Year == i) %>% transmute(Observed/Pop))$RR %>% 
+    localG(mat2listw(mat1, style = 'B'), return_internals = F)
+  
+  
+  
+  temp <- st_as_sf(filter(malPop, Year == i) %>% 
+                     inner_join(boundaries, by = join_by(Name == admin1Name)))
+  
+  plot(st_geometry(temp),
+       col=Pal(3)[as.numeric(cut(-scale(gstat, scale = F),breaks = 3))])
+
+}
+```
+
+Trying to extract only ones that are significantly greater than or significantly less than the expected at the $alpha = 0.05$ level.
+
+```{r}
+temp2 <- 2+1*(attributes(gstat)$internals[,4]< -1.644) - 1*(attributes(gstat)$internals[,4] > 1.644)
+
+
+plot(st_geometry(temp),
+     col=Pal(3)[temp2])
+
+```
+
+Looping through all the years now
+
+```{r}
+
+for(i in 2010:2022){
+
+  gstat <- (filter(malPop, Year == i) %>% transmute(Observed/Pop))$`Observed/Pop`%>% 
+    localG(mat2listw(mat1, style = 'B'), return_internals = F)
+  
+  
+  
+  temp <- st_as_sf(filter(malPop, Year == i) %>% inner_join(boundaries, by = join_by(Name == admin1Name)))
+  
+  temp2 <- 2+1*(attributes(gstat)$internals[,4]< -1.644) - 1*(attributes(gstat)$internals[,4] > 1.644)
+
+
+  plot(st_geometry(temp),
+      col=Pal(3)[temp2])
+}
+```

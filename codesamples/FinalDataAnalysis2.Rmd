@@ -1,0 +1,216 @@
+---
+title: "FinalDataAnalysis2"
+author: "Jack Kissell"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+---
+
+```{r}
+library(tidyverse)
+library(vars)
+library(ggplot2)
+library(gridExtra)
+```
+
+
+```{r}
+# Load the dataset
+data <- read_csv("economic_data_2000_2019.csv", show_col_types = FALSE)
+data$date <- as.Date(data$date)
+
+#simplify
+data <- data[,c("Real_GDP", "CPI_Inflation", "WTI_Crude_Oil_Prices", "date")]
+
+# Remove missing values
+data <- na.omit(data)
+```
+
+```{r}
+png('data_ts.png')
+
+# Step 1: Exploratory Analysis
+data_long <- data %>%
+  pivot_longer(-date, names_to = "variable", values_to = "value")
+
+ggplot(data_long, aes(x = date, y = value, color = variable)) +
+  geom_line() +
+  facet_wrap(~ variable, scales = "free_y", ncol=1) +
+  labs(title = "Time Series of Variables", x = "Date", y = "Value") +
+  theme_minimal() +
+  theme(legend.position="none")
+
+# Prepare data for VAR analysis
+var_data <- data %>% dplyr::select(-date)
+```
+
+Here we will end up with a $(3 \times 7)$ coefficient matrix: 3 rows, 1 for each variable; 7 columns correspond to the intercept plus the 2 lags for each variable.
+
+```{r}
+# Step 2: Create a time series object for VAR model
+ts_data <- ts(var_data, start = c(2000, 1), frequency = 4)
+
+# test for stationarity
+acf(ts_data[,1])
+acf(ts_data[,2])
+acf(ts_data[,3])
+
+# Step 3: Fit VAR(2) Model
+var_model_2 <- VAR(ts_data, p = 2, type = "const")
+```
+
+
+```{r}
+# Step 4: Covariance Matrix of Residuals
+cov_matrix <- cov(residuals(var_model_2), use = "complete.obs")
+print(cov_matrix)
+```
+
+
+```{r}
+# Step 5: Impulse Responses (IRFs)
+irf <- irf(var_model_2, impulse = colnames(var_data), response = colnames(var_data), n.ahead = 10, boot = TRUE, ortho = FALSE)
+```
+
+
+```{r}
+# Step 6: Plot IRFs
+png('IRF.png')
+
+par(mfrow=c(2,2))
+
+plot_irf <- function(irf_result, impulse, response) {
+  irf_data <- as.data.frame(irf_result$irf[[impulse]])
+  ci_lower <- as.data.frame(irf_result$Lower[[impulse]])
+  ci_upper <- as.data.frame(irf_result$Upper[[impulse]])
+  
+  df <- tibble(
+    time = 1:nrow(irf_data),
+    irf = irf_data[[response]],
+    ci_lower = ci_lower[[response]],
+    ci_upper = ci_upper[[response]]
+  )
+  
+  ggplot(df, aes(x = time)) +
+    geom_line(aes(y = irf), color = "dodgerblue4") +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.3, fill = "gray") +
+    labs(
+      title = paste(impulse, "on", response),
+      x = "Horizon (Quarters)",
+      y = "Response"
+    ) +
+    geom_hline(yintercept=0, linetype="dotted", color = "black") +
+    theme_classic() + 
+    theme(axis.title=element_text(size=6), plot.title=element_text(size=8))
+}
+
+for (impulse in colnames(var_data)) {
+  for (response in colnames(var_data)) {
+    nam <- paste0("p_",impulse,"_",response)
+    assign(nam, plot_irf(irf, impulse, response))
+  }
+}
+
+plotlist <- lapply(ls(pattern="p_"), get)
+marrangeGrob(plotlist, nrow = 3, ncol = 3, top = NULL)
+```
+
+```{r}
+# Step 8: Orthogonal Impulse Responses (OIRs)
+oirf <- irf(var_model_2, impulse = colnames(var_data), response = colnames(var_data), n.ahead = 10, boot = TRUE, ortho = TRUE)
+```
+
+```{r}
+# only repeating this function definition to change color
+png('OIRF.png')
+
+plot_irf <- function(irf_result, impulse, response) {
+  irf_data <- as.data.frame(irf_result$irf[[impulse]])
+  ci_lower <- as.data.frame(irf_result$Lower[[impulse]])
+  ci_upper <- as.data.frame(irf_result$Upper[[impulse]])
+  
+  df <- tibble(
+    time = 1:nrow(irf_data),
+    irf = irf_data[[response]],
+    ci_lower = ci_lower[[response]],
+    ci_upper = ci_upper[[response]]
+  )
+  
+  ggplot(df, aes(x = time)) +
+    geom_line(aes(y = irf), color = "dodgerblue4") +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.3, fill = "gray") +
+    labs(
+      title = paste(impulse, "on", response),
+      x = "Horizon (Quarters)",
+      y = "Response"
+    ) +
+    geom_hline(yintercept=0, linetype="dotted", color = "black") +
+    theme_classic() + 
+    theme(axis.title=element_text(size=6), plot.title=element_text(size=8))
+}
+
+for (impulse in colnames(var_data)) {
+  for (response in colnames(var_data)) {
+    nam <- paste0("p2_",impulse,"_",response)
+    assign(nam, plot_irf(oirf, impulse, response))
+  }
+}
+
+plotlist2 <- lapply(ls(pattern="p2_"), get)
+marrangeGrob(plotlist2, nrow = 3, ncol = 3, top = NULL)
+```
+
+```{r}
+#table 1: coefficient matrix of VAR(2)
+coeffmat <- coef(var_model_2)
+coeffmat
+
+write.csv(coeffmat, "coefficients.csv")
+```
+
+
+```{r}
+#table 2: variance-covariance matrix Sigma:
+model_summary <- summary(var_model_2)
+
+# Obtain variance-covariance matrix
+cat("Covariance matrix of residuals:\n")
+print(model_summary$covres)
+cat("Correlation matrix of residuals:\n")
+print(model_summary$corres)
+```
+
+```{r}
+#table 3: Cholesky Decomposition of Sigma
+cholesky <-t(chol(model_summary$covres))
+```
+
+```{r}
+write.csv(model_summary$covres, "covariance.csv")
+write.csv(cholesky, "cholesky.csv")
+```
+
+
+
+```{r}
+#plot: FEVD
+fdecomp <- fevd(var_model_2)
+plot(fdecomp)
+```
+
+```{r}
+#alt plot FEVD using ggplot:
+png('FEVD.png')
+
+dat <- map_df(fdecomp, ~as.data.frame(.x), .id="id") %>%
+    mutate(horizon = rep(1:10, 3)) %>%
+    pivot_longer(names_to = "var", cols = c(WTI_Crude_Oil_Prices, CPI_Inflation, Real_GDP))
+#head(dat)
+
+ggplot(data = dat, mapping = aes(x = horizon, y = value, fill = var)) +
+  facet_wrap(~id, nrow=3, ncol=1) +
+  geom_bar(stat = "identity") +
+  ylab("Proportion")
+```
+
+
